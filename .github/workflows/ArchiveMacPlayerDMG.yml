@@ -1,0 +1,177 @@
+name: Archive MacPlayer Deployments
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Run daily
+  workflow_dispatch:
+
+permissions:
+  contents: write # Required for creating releases
+
+jobs:
+  archive-macplayer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+        continue-on-error: true
+
+      - name: Set up WARP
+        uses: fscarmen/warp-on-actions@v1.2
+        with:
+          stack: dual   # Optional. Support [ ipv4, ipv6, dual ]. Default is dual.
+
+      - name: Download and check DeployHistory
+        id: check-deploy
+        run: |
+          binary_type=MacPlayer
+          deploy_url=https://setup.rbxcdn.com/mac/DeployHistory.txt
+          type_filter=Client
+          echo "Checking DeployHistory for $binary_type" | tee -a deploy_log_${binary_type}.txt
+          
+          # Try primary URL
+          http_status=$(curl -s -w "%{http_code}" -o DeployHistory_${binary_type}.txt "$deploy_url" || echo "000")
+          echo "HTTP status for $deploy_url: $http_status" | tee -a deploy_log_${binary_type}.txt
+          
+          if [ "$http_status" != "200" ]; then
+            # Try fallback URL
+            deploy_url="https://setup.rbxcdn.com/channel/common/mac/DeployHistory.txt"
+            http_status=$(curl -s -w "%{http_code}" -o DeployHistory_${binary_type}.txt "$deploy_url" || echo "000")
+            echo "HTTP status for fallback $deploy_url: $http_status" | tee -a deploy_log_${binary_type}.txt
+          fi
+          if [ "$http_status" != "200" ] || [ ! -s DeployHistory_${binary_type}.txt ]; then
+            echo "Warning: Failed to download valid DeployHistory for $binary_type (HTTP status: $http_status)" | tee -a deploy_log_${binary_type}.txt
+            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "version=none" >> $GITHUB_OUTPUT
+          else
+            # Log last 10 lines for debugging
+            echo "Last 10 lines of DeployHistory_${binary_type}.txt:" | tee -a deploy_log_${binary_type}.txt
+            tail -n 10 DeployHistory_${binary_type}.txt >> deploy_log_${binary_type}.txt
+            
+            # Calculate hash
+            hash=$(md5sum DeployHistory_${binary_type}.txt | awk '{print $1}' || echo "unknown")
+            echo "$binary_type Hash: $hash" | tee -a deploy_log_${binary_type}.txt
+            
+            # Check for updates
+            if [ -f "last_${binary_type}_hash.txt" ]; then
+              last_hash=$(cat last_${binary_type}_hash.txt)
+              if [ "$hash" != "$last_hash" ]; then
+                echo "$binary_type DeployHistory updated!" | tee -a deploy_log_${binary_type}.txt
+                echo "updated=true" >> $GITHUB_OUTPUT
+              else
+                echo "$binary_type DeployHistory unchanged" | tee -a deploy_log_${binary_type}.txt
+                echo "updated=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "$binary_type DeployHistory first run" | tee -a deploy_log_${binary_type}.txt
+              echo "updated=true" >> $GITHUB_OUTPUT
+            fi
+            echo "$hash" > last_${binary_type}_hash.txt
+            
+            # Extract version
+            version=$(grep "New $type_filter" DeployHistory_${binary_type}.txt | grep -o 'version-[0-9a-f]\{16\}' | tail -n 1 || echo "none")
+            echo "$binary_type Latest Version: $version" | tee -a deploy_log_${binary_type}.txt
+            echo "version=$version" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Validate package URLs
+        if: steps.check-deploy.outputs.updated == 'true' && steps.check-deploy.outputs.version != 'none'
+        run: |
+          binary_type=MacPlayer
+          version=${{ steps.check-deploy.outputs.version }}
+          blob_dir=/mac/
+          echo "" > valid_urls_${binary_type}.txt
+          echo "" > validation_log_${binary_type}.txt
+          
+          # Validate package
+          pkg_url="https://setup.rbxcdn.com${blob_dir}${version}-Roblox.dmg"
+          status=$(curl -s -I -o /dev/null -w "%{http_code}" "$pkg_url" || echo "000")
+          echo "Checking package (1/1): $pkg_url (status: $status)" | tee -a validation_log_${binary_type}.txt
+          if [ "$status" == "200" ]; then
+            echo "Valid package: $pkg_url" | tee -a validation_log_${binary_type}.txt
+            echo "$pkg_url" >> valid_urls_${binary_type}.txt
+          else
+            echo "Failed to validate package: $pkg_url" | tee -a validation_log_${binary_type}.txt
+          fi
+        continue-on-error: true
+
+      - name: Download valid packages
+        if: steps.check-deploy.outputs.updated == 'true' && steps.check-deploy.outputs.version != 'none'
+        run: |
+          binary_type=MacPlayer
+          mkdir -p downloads/${binary_type}
+          if [ -s valid_urls_${binary_type}.txt ]; then
+            total_urls=$(wc -l < valid_urls_${binary_type}.txt)
+            url_count=0
+            while read -r url; do
+              [ -z "$url" ] && { echo "Skipping empty URL for download" | tee -a validation_log_${binary_type}.txt; continue; }
+              url_count=$((url_count + 1))
+              filename=$(basename "$url")
+              echo "Downloading package ($url_count/$total_urls): $url" | tee -a validation_log_${binary_type}.txt
+              curl -s -L -o "downloads/${binary_type}/${filename}" "$url" || echo "Failed to download $url, continuing..."
+              if [ $? -eq 0 ]; then
+                echo "Successfully downloaded package ($url_count/$total_urls): $url to downloads/${binary_type}/${filename}" | tee -a validation_log_${binary_type}.txt
+              fi
+            done < valid_urls_${binary_type}.txt
+          else
+            echo "No valid URLs to download for $binary_type" | tee -a validation_log_${binary_type}.txt
+          fi
+        continue-on-error: true
+
+      - name: Upload logs and valid URLs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-and-urls-MacPlayer
+          path: |
+            deploy_log_MacPlayer.txt
+            valid_urls_MacPlayer.txt
+            validation_log_MacPlayer.txt
+        continue-on-error: true
+
+      - name: Upload downloaded packages
+        if: steps.check-deploy.outputs.updated == 'true' && steps.check-deploy.outputs.version != 'none'
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-MacPlayer
+          path: downloads/MacPlayer/*
+        continue-on-error: true
+
+      - name: Create and upload to release
+        if: steps.check-deploy.outputs.updated == 'true' && steps.check-deploy.outputs.version != 'none'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=${{ steps.check-deploy.outputs.version }}
+          tag_name="MacPlayer-${version}"
+          
+          # Create release
+          gh release create "$tag_name" \
+            --title "$version" \
+            --notes "MacPlayer deployment artifacts for version $version" \
+            --draft=false \
+            || { echo "Failed to create release, continuing..."; exit 0; }
+          
+          # Upload log files
+          for file in deploy_log_MacPlayer.txt valid_urls_MacPlayer.txt validation_log_MacPlayer.txt; do
+            if [ -f "$file" ]; then
+              gh release upload "$tag_name" "$file" --clobber || echo "Failed to upload $file to release, continuing..."
+            fi
+          done
+          
+          # Upload downloaded packages
+          if [ -d "downloads/MacPlayer" ]; then
+            for file in downloads/MacPlayer/*; do
+              if [ -f "$file" ]; then
+                gh release upload "$tag_name" "$file" --clobber || echo "Failed to upload $file to release, continuing..."
+              fi
+            done
+          fi
+        continue-on-error: true
