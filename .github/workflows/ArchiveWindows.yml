@@ -1,0 +1,463 @@
+name: Archive Windows Roblox Deployments
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+    inputs:
+      force_rerun:
+        description: 'Ignore hash cache and force archiving even if DeployHistory is unchanged'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: archive-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    name: Archive ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: WindowsPlayer
+            api_binary_type: "WindowsPlayer"
+            deploy_url: "https://setup.rbxcdn.com/DeployHistory.txt"
+            fallback_url: "https://setup.rbxcdn.com/channel/common/DeployHistory.txt"
+            type_filter: WindowsPlayer
+            blob_dir: "/"
+            packages: "" # Manifest-driven: packages fetched from rbxPkgManifest.txt at runtime
+            has_manifest: true
+          - target: WindowsStudio64
+            api_binary_type: "WindowsStudio64"
+            deploy_url: "https://setup.rbxcdn.com/DeployHistory.txt"
+            fallback_url: "https://setup.rbxcdn.com/channel/common/DeployHistory.txt"
+            type_filter: Studio64
+            blob_dir: "/"
+            packages: "" # Manifest-driven: packages fetched from rbxPkgManifest.txt at runtime
+            has_manifest: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set up WARP
+        uses: fscarmen/warp-on-actions@v1.2
+        with:
+          stack: dual
+
+      - name: Install waybackpy
+        run: pip install waybackpy -U
+
+      - name: Restore previous hash
+        uses: actions/cache/restore@v4
+        with:
+          path: last_hash.txt
+          key: deploy-hash-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: deploy-hash-${{ matrix.target }}-
+
+      - name: Download and check DeployHistory
+        id: check-deploy
+        run: |
+          set -u
+
+          target="${{ matrix.target }}"
+          deploy_url="${{ matrix.deploy_url }}"
+          fallback_url="${{ matrix.fallback_url }}"
+          type_filter="${{ matrix.type_filter }}"
+          force_rerun="${{ github.event.inputs.force_rerun == 'true' && 'true' || 'false' }}"
+
+          echo "## Checking DeployHistory for ${target}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Try primary URL
+          http_status=$(curl -s -w "%{http_code}" -o DeployHistory.txt "$deploy_url" || echo "000")
+          echo "- Primary URL ($deploy_url): HTTP $http_status" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$http_status" != "200" ]; then
+            http_status=$(curl -s -w "%{http_code}" -o DeployHistory.txt "$fallback_url" || echo "000")
+            echo "- Fallback URL ($fallback_url): HTTP $http_status" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$http_status" != "200" ] || [ ! -s DeployHistory.txt ]; then
+            echo "::warning::Failed to download DeployHistory for $target (HTTP $http_status)"
+            echo "- ❌ Failed to download valid DeployHistory" >> $GITHUB_STEP_SUMMARY
+            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "release_version=none" >> $GITHUB_OUTPUT
+            echo "download_hash=none" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Calculate hash
+          current_hash=$(md5sum DeployHistory.txt | awk '{print $1}')
+          echo "- Current hash: \`$current_hash\`" >> $GITHUB_STEP_SUMMARY
+
+          # Compare with previous hash (skip entirely when force_rerun is set)
+          if [ "$force_rerun" = "true" ]; then
+            echo "- 🔁 Force rerun: ignoring hash cache" >> $GITHUB_STEP_SUMMARY
+          elif [ -f last_hash.txt ]; then
+            previous_hash=$(cat last_hash.txt | tr -d '[:space:]')
+            if [ "$current_hash" = "$previous_hash" ]; then
+              echo "- ⏭️ DeployHistory unchanged since last run" >> $GITHUB_STEP_SUMMARY
+              echo "updated=false" >> $GITHUB_OUTPUT
+              echo "release_version=none" >> $GITHUB_OUTPUT
+              echo "download_hash=none" >> $GITHUB_OUTPUT
+              echo "$current_hash" > last_hash.txt
+              exit 0
+            fi
+            echo "- 🔄 DeployHistory updated!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- 🆕 First run - no previous hash found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "$current_hash" > last_hash.txt
+          echo "updated=true" >> $GITHUB_OUTPUT
+
+          # Find the matching latest line
+          line=$(grep "New $type_filter" DeployHistory.txt | tail -n 1)
+
+          # --- release_version: prefer git hash field, fallback to file version ---
+          release_version=$(echo "$line" | grep -oE 'git hash:[[:space:]]*[^[:space:],]+' | sed 's/.*:[[:space:]]*//' | tail -n 1)
+          if [ -z "$release_version" ]; then
+            raw_fv=$(echo "$line" | grep -oE 'file version:[[:space:]]*[0-9,\s]+' | sed 's/file version:[[:space:]]*//' | tail -n 1)
+            release_version=$(echo "$raw_fv" | tr -d ' ' | tr ',' '.')
+          fi
+          [ -z "$release_version" ] && release_version="none"
+          echo "- 🏷️ Release version: \`$release_version\`" >> $GITHUB_STEP_SUMMARY
+
+          # --- download_hash: old format direct, version-hidden via API ---
+          download_hash=$(echo "$line" | grep -oE 'version-[a-f0-9]{16}' | tail -n 1)
+          if [ -z "$download_hash" ]; then
+            # version-hidden -> resolve via clientsettings API
+            api_bt="${{ matrix.api_binary_type }}"
+            download_hash=$(curl -s "https://clientsettingscdn.roblox.com/v2/client-version/${api_bt}" | jq -r '.clientVersionUpload' 2>/dev/null)
+            # validate it's version-<16hex>
+            case "$download_hash" in
+              version-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;;
+              *) download_hash="none" ;;
+            esac
+          fi
+          [ -z "$download_hash" ] || [ "$download_hash" = "none" ] && download_hash="none"
+          echo "- 📦 Download hash: \`$download_hash\`" >> $GITHUB_STEP_SUMMARY
+
+          echo "release_version=$release_version" >> $GITHUB_OUTPUT
+          echo "download_hash=$download_hash" >> $GITHUB_OUTPUT
+
+      - name: Save hash cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: last_hash.txt
+          key: deploy-hash-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Validate package URLs
+        id: validate-urls
+        if: steps.check-deploy.outputs.updated == 'true' && steps.check-deploy.outputs.release_version != 'none' && steps.check-deploy.outputs.download_hash != 'none'
+        run: |
+          set -u
+
+          target="${{ matrix.target }}"
+          download_hash="${{ steps.check-deploy.outputs.download_hash }}"
+          blob_dir="${{ matrix.blob_dir }}"
+          has_manifest="${{ matrix.has_manifest }}"
+          base_url="https://setup.rbxcdn.com"
+
+          > valid_urls.txt
+          > archive_log.txt
+
+          valid_count=0
+          checked_count=0
+
+          # Guard: skip validation if download_hash is 'none'
+          if [ "$download_hash" = "none" ]; then
+            echo "download_hash is 'none', skipping URL validation" >> $GITHUB_STEP_SUMMARY
+            echo "valid_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$has_manifest" = "true" ]; then
+            # Manifest-driven: fetch rbxPkgManifest.txt, parse package list
+            manifest_url="${base_url}${blob_dir}${download_hash}-rbxPkgManifest.txt"
+            echo "Fetching manifest: $manifest_url" | tee -a archive_log.txt
+            curl -s -o rbxPkgManifest.txt "$manifest_url"
+
+            # Normalize CRLF -> LF (Roblox CDN manifest uses CRLF line endings)
+            tr -d '\r' < rbxPkgManifest.txt > rbxPkgManifest.tmp && mv rbxPkgManifest.tmp rbxPkgManifest.txt
+
+            # Validate manifest content
+            if [ ! -s rbxPkgManifest.txt ] || ! head -1 rbxPkgManifest.txt | grep -q '^v0'; then
+              echo "::warning::Manifest missing or invalid for $target"
+              echo "Manifest missing or invalid for $target" >> $GITHUB_STEP_SUMMARY
+              echo "valid_count=0" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "Manifest downloaded and valid (v0 format)" | tee -a archive_log.txt
+            checked_count=$((checked_count + 1))
+
+            # Extract package filenames from manifest (lines ending in .zip)
+            packages_from_manifest=$(grep '\.zip$' rbxPkgManifest.txt || true)
+
+            if [ -z "$packages_from_manifest" ]; then
+              echo "::warning::No .zip packages found in manifest for $target"
+              echo "valid_count=0" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            pkg_count=$(echo "$packages_from_manifest" | wc -l | tr -d ' ')
+            echo "Found $pkg_count packages in manifest" | tee -a archive_log.txt
+
+            # Validate each package URL from manifest
+            while IFS= read -r pkg; do
+              [ -z "$pkg" ] && continue
+              pkg_url="${base_url}${blob_dir}${download_hash}-${pkg}"
+              pkg_status=$(curl -s -o /dev/null -w "%{http_code}" "$pkg_url" || echo "000")
+              checked_count=$((checked_count + 1))
+              echo "[$checked_count] $pkg: $pkg_status" | tee -a archive_log.txt
+              if [ "$pkg_status" = "200" ]; then
+                echo "$pkg_url" >> valid_urls.txt
+                valid_count=$((valid_count + 1))
+              fi
+            done <<< "$packages_from_manifest"
+
+          else
+            # Single-package: Mac targets (no manifest, uses matrix.packages)
+            IFS=',' read -ra PKGS <<< "${{ matrix.packages }}"
+            for pkg in "${PKGS[@]}"; do
+              pkg_url="${base_url}${blob_dir}${download_hash}-${pkg}"
+              pkg_status=$(curl -s -o /dev/null -w "%{http_code}" "$pkg_url" || echo "000")
+              checked_count=$((checked_count + 1))
+              echo "[$checked_count] $pkg: $pkg_status" | tee -a archive_log.txt
+              if [ "$pkg_status" = "200" ]; then
+                echo "$pkg_url" >> valid_urls.txt
+                valid_count=$((valid_count + 1))
+              fi
+            done
+          fi
+
+          echo "" | tee -a archive_log.txt
+          echo "Valid: $valid_count / $checked_count" | tee -a archive_log.txt
+          echo "valid_count=$valid_count" >> $GITHUB_OUTPUT
+
+          echo "## Package Validation" >> $GITHUB_STEP_SUMMARY
+          echo "- Checked: $checked_count packages" >> $GITHUB_STEP_SUMMARY
+          echo "- Valid: $valid_count packages" >> $GITHUB_STEP_SUMMARY
+
+      - name: Archive URLs via Wayback Machine
+        if: steps.check-deploy.outputs.updated == 'true' && steps.check-deploy.outputs.release_version != 'none' && steps.check-deploy.outputs.download_hash != 'none' && steps.validate-urls.outputs.valid_count != '0'
+        run: |
+          set +e
+
+          target="${{ matrix.target }}"
+          download_hash="${{ steps.check-deploy.outputs.download_hash }}"
+          user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+
+          total=$(wc -l < valid_urls.txt | tr -d ' ')
+          idx=0
+          archived=0
+          failed=0
+
+          echo "## Wayback Machine Archive" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            idx=$((idx + 1))
+
+            success=false
+            for attempt in 1 2 3; do
+              if python3 -c "
+          import waybackpy
+          wb = waybackpy.Url(\"$url\", \"$user_agent\")
+          archive = wb.save()
+          print(f'Archived: {archive}')
+          " >> archive_log.txt 2>&1; then
+                echo "[$idx/$total] ✅ $url"
+                success=true
+                break
+              fi
+              echo "[$idx/$total] ⚠️ Attempt $attempt failed: $url"
+              if [ "$attempt" -lt 3 ]; then
+                echo "    Retrying in 120 seconds..." | tee -a archive_log.txt
+                sleep 120
+              fi
+            done
+
+            if [ "$success" = "true" ]; then
+              archived=$((archived + 1))
+            else
+              failed=$((failed + 1))
+            fi
+          done < valid_urls.txt
+
+          echo "- Archived: $archived" >> $GITHUB_STEP_SUMMARY
+          echo "- Failed: $failed" >> $GITHUB_STEP_SUMMARY
+        continue-on-error: true
+
+      - name: Download valid packages
+        if: steps.check-deploy.outputs.updated == 'true' && steps.check-deploy.outputs.release_version != 'none' && steps.check-deploy.outputs.download_hash != 'none'
+        run: |
+          set -u
+
+          target="${{ matrix.target }}"
+          download_hash="${{ steps.check-deploy.outputs.download_hash }}"
+          mkdir -p "downloads/${target}"
+
+          total=$(wc -l < valid_urls.txt | tr -d ' ')
+          idx=0
+          downloaded=0
+
+          echo "## Downloads" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            idx=$((idx + 1))
+            filename=$(basename "$url")
+
+            if curl -sL -o "downloads/${target}/${filename}" "$url"; then
+              size=$(stat -c%s "downloads/${target}/${filename}" 2>/dev/null || echo "?")
+              echo "- ✅ $filename ($size bytes)" >> $GITHUB_STEP_SUMMARY
+              downloaded=$((downloaded + 1))
+            else
+              echo "- ❌ Failed: $filename" >> $GITHUB_STEP_SUMMARY
+            fi
+          done < valid_urls.txt
+
+          echo "- Total downloaded: $downloaded / $total" >> $GITHUB_STEP_SUMMARY
+
+      - name: Merge packages into combined archive
+        id: merge-packages
+        if: ${{ matrix.has_manifest == 'true' && steps.check-deploy.outputs.release_version != 'none' && steps.check-deploy.outputs.download_hash != 'none' && steps.validate-urls.outputs.valid_count != '0' }}
+        run: |
+          set -u
+
+          target="${{ matrix.target }}"
+          download_hash="${{ steps.check-deploy.outputs.download_hash }}"
+          release_version="${{ steps.check-deploy.outputs.release_version }}"
+
+          echo "## Merging packages into one directory" >> $GITHUB_STEP_SUMMARY
+
+          # 1. Create merged directory
+          mkdir -p "merged/${target}"
+
+          # 2. Unzip all downloaded packages into the single merged dir (-o overwrite merges shared top-level dirs like content/)
+          unzipped=0
+          for zipfile in "downloads/${target}"/*.zip; do
+            [ -f "$zipfile" ] || continue
+            if unzip -o -q "$zipfile" -d "merged/${target}"; then
+              unzipped=$((unzipped + 1))
+              echo "- ✅ Unzipped: $(basename "$zipfile")" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- ⚠️ Failed to unzip: $(basename "$zipfile")" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          # 3. Re-zip merged dir into a single complete archive
+          complete_zip="merged/${target}-${download_hash}-complete.zip"
+          # zip must run from inside the merged dir so the archive root is the merged content
+          cd "merged/${target}" || exit 1
+          zip -r -q "../${target}-${download_hash}-complete.zip" .
+          cd - >/dev/null 2>&1 || true
+
+          echo "- 📦 Combined archive created: ${complete_zip}" >> $GITHUB_STEP_SUMMARY
+          echo "- Unzipped $unzipped package(s)" >> $GITHUB_STEP_SUMMARY
+
+          # Output the path for later steps
+          echo "complete_zip=${complete_zip}" >> $GITHUB_OUTPUT
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.target }}
+          path: |
+            valid_urls.txt
+            archive_log.txt
+          retention-days: 7
+        continue-on-error: true
+
+      - name: Create release with version
+        if: steps.check-deploy.outputs.updated == 'true' && steps.check-deploy.outputs.release_version != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+
+          target="${{ matrix.target }}"
+          release_version="${{ steps.check-deploy.outputs.release_version }}"
+          tag="${target}-${release_version}"
+
+          echo "## Creating Release" >> $GITHUB_STEP_SUMMARY
+          echo "- Tag: \`$tag\`" >> $GITHUB_STEP_SUMMARY
+
+          # Create release
+          if gh release create "$tag" \
+            --title "${target} ${release_version}" \
+            --notes "Automated archive of ${target} deployment version ${release_version}" \
+            --draft=false; then
+            echo "- ✅ Release created" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "::warning::Failed to create release $tag (may already exist)"
+            echo "- ⚠️ Release may already exist" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Upload log files
+          for file in valid_urls.txt archive_log.txt; do
+            if [ -f "$file" ]; then
+              gh release upload "$tag" "$file" --clobber || true
+            fi
+          done
+
+          # Upload downloaded packages
+          if [ -d "downloads/${target}" ]; then
+            for file in "downloads/${target}"/*; do
+              if [ -f "$file" ]; then
+                gh release upload "$tag" "$file" --clobber || true
+              fi
+            done
+          fi
+
+          # Upload combined archive (Windows only)
+          for file in "merged"/*-complete.zip; do
+            if [ -f "$file" ]; then
+              gh release upload "$tag" "$file" --clobber || true
+            fi
+          done
+
+          echo "- ✅ Assets uploaded" >> $GITHUB_STEP_SUMMARY
+        continue-on-error: true
+
+      - name: Keep workflow alive (ping)
+        if: ${{ matrix.target == 'WindowsPlayer' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          date > last_ping.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last_ping.txt
+
+          # Only commit if there is an actual change
+          if ! git diff --cached --quiet; then
+            git commit -m "Keep alive: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            # Push using the token
+            git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git HEAD:${GITHUB_REF_NAME}
+          else
+            echo "No change to commit (same timestamp)"
+          fi
+        continue-on-error: true
