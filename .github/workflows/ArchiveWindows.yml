@@ -339,7 +339,7 @@ jobs:
 
       - name: Merge packages into combined archive
         id: merge-packages
-        if: ${{ matrix.has_manifest == 'true' && steps.check-deploy.outputs.release_version != 'none' && steps.check-deploy.outputs.download_hash != 'none' && steps.validate-urls.outputs.valid_count != '0' }}
+        if: ${{ matrix.has_manifest && steps.check-deploy.outputs.release_version != 'none' && steps.check-deploy.outputs.download_hash != 'none' && steps.validate-urls.outputs.valid_count != '0' }}
         run: |
           set -u
 
